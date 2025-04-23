@@ -1,0 +1,690 @@
+# -*- coding: utf-8 -*-
+import os
+import google.generativeai as genai
+from google.generativeai import types
+import sys
+import json
+import pandas as pd
+import re # For parsing question numbers
+import time # To add slight delay between API calls and retries
+from datetime import datetime # To get the generation timestamp
+
+# --- Configuration ---
+API_KEY_ENV_VAR = "GEMINI_API_KEY"
+FILE_PATH = "23.1-Senior-Facilities-Agreement-Ares-Management-Limited-dated-27-November-2023.pdf"
+# FILE_PATH = "Cobham-Ultra-SFA.pdf"
+MODEL_NAME = "gemini-2.5-pro-preview-03-25" # User-specified model
+EXCEL_OUTPUT_FILE = "Analysis_Output.xlsx"
+MAX_VALIDATION_RETRIES = 1 # Number of times to retry if validation fails (0 means no retry)
+RETRY_DELAY_SECONDS = 3    # Wait time before retrying validation
+
+# --- Schema Definition (as Python Dictionary) ---
+# Schema expected FROM THE AI
+ai_response_schema_dict = {
+  "type": "array",
+  "description": "A list containing numbered questions, their categories, answers, clause references, clause wording, and justifications based on the facility agreement analysis.",
+  "items": {
+    "type": "object",
+    "description": "An object representing a single numbered question, its category, the generated answer, and the specific evidence (clause reference and wording) and justification.",
+    "properties": {
+      "Question Number": {"type": "integer"},
+      "Question Category": {"type": "string"},
+      "Question": {"type": "string"},
+      "Answer": {"type": "string"},
+      "Answer Justification": {"type": "string"},
+      "Clause Reference": {"type": "string"},
+      "Clause Wording": {"type": "string"},
+    },
+    "required": [
+      "Question Number", "Question Category", "Question", "Answer", "Answer Justification",
+      "Clause Reference", "Clause Wording"
+    ]
+  }
+}
+
+# Keys required FROM THE AI for validation
+AI_REQUIRED_KEYS = set(ai_response_schema_dict['items']['required'])
+
+# FINAL desired column order for Excel output
+EXCEL_COLUMN_ORDER = [
+    "File Name", "Generation Time", "Question Number", "Question Category",
+    "Question", "Answer", "Answer Justification", "Clause Reference", "Clause Wording"
+    
+]
+
+# --- Full Prompt Text (Template with ALL questions) ---
+# (Keep the full prompt text as it was - omitted here for brevity)
+full_prompt_text = """**Task:**
+Your primary task is to meticulously analyse the attached facility agreement document. You MUST answer **every single question** listed below for the specified section. Prioritise accuracy and direct evidence from the text.
+
+**Output Requirements:**
+Generate a **single JSON array** as output, strictly adhering to the provided schema. Each object within the array MUST correspond to one question from the filtered list below. Ensure all **required** properties (`Question Number`, `Question Category`, `Question`, `Answer`, `Clause Reference`, `Clause Wording`, `Answer Justification`) are present in every object.
+
+*   **Completeness:** Ensure an object is generated for **every question** in the filtered list, even conditional ones.
+*   **Question Number:** Populate the 'Question Number' field with the corresponding number from the original list (1 to 78).
+*   **Answers:** Populate the 'Answer' field based on your analysis.
+    *   For questions with 'Answer Options', your 'Answer' **MUST** contain one of the provided options exactly as written (unless the option indicates free text like 'BLANK', 'Text', 'Date', in which case provide the specific text/date found).
+    *   For 'Multiselect' options, list all applicable options separated by commas.
+    *   If the document does not contain the information to answer a question, state 'Information Not Found' in the 'Answer' field.
+*   **Evidence:**
+    *   Populate the 'Clause Reference' field with the specific clause number(s) or section(s) referenced (e.g., 'Clause 14.1(a)', 'Section 5'). If no specific clause provides the answer, state 'N/A'.
+    *   Populate the 'Clause Wording' field with the **exact, full text** of the referenced clause(s) or relevant sentence(s). If 'Clause Reference' is 'N/A', this should also be 'N/A'.
+*   **Justification:** Populate the 'Answer Justification' field to briefly explain *why* the referenced clause and wording support the given 'Answer', especially if it's not immediately obvious. If the answer is 'Information Not Found' or 'N/A', explain briefly why (e.g., "Condition not met", "Term not defined in document").
+*   **Conditional Questions:** For questions with bracketed conditions (e.g., '[If yes...]'), if the condition is **not met** based on the answer to the preceding question *within the current section*, you MUST still include the question object in the JSON array. In such cases, set the 'Answer', 'Clause Reference', 'Clause Wording', and 'Answer Justification' fields to 'N/A - Condition Not Met'. Ensure the 'Question Number' field is still populated correctly.
+
+**Questions to Answer:**
+
+1.  **Question Category:** Agreement Details
+    **Question:** What is the date of the agreement you are reviewing?
+    **Answer Options:** Date
+2.  **Question Category:** Agreement Details
+    **Question:** Has a signed version of the agreement you are reviewing been provided?
+    **Answer Options:** Yes, No
+3.  **Question Category:** Agreement Details
+    **Question:** Governing law
+    **Answer Options:** Text *(Extract the specific governing law stated in the agreement)*
+4.  **Question Category:** Agreement Details
+    **Question:** Please detail the clause number of the governing law clause
+    **Answer Options:** BLANK
+5.  **Question Category:** Eligibility Part 1
+    **Question:** Does the agreement contain express provisions relating to sub-participations by Lenders?
+    **Answer Options:** Yes, No
+6.  **Question Category:** Eligibility Part 1
+    **Question:** [If yes to Q5] Is sub-participation defined?
+    **Answer Options:** Yes, No
+7.  **Question Category:** Eligibility Part 1
+    **Question:** [If yes to Q6] Please set out the relevant definition of sub-participation (including clause reference)
+    **Answer Options:** BLANK
+8.  **Question Category:** Eligibility Part 1
+    **Question:** Does the definition of sub-participation capture SRT?
+    **Answer Options:** Option to select: No - definition only relates to transfer of voting rights and/or total return swap or derivatives generally, Yes - definition expressly refers to securitisation, SRT, credit default swaps and/or any risk trade or any of the following key terms "risk protection", "credit protection", "risk mitigation", "risk transfer", "synthetic", "credit default swap", "securitisation", "risk or funded", "funded or risk", "credit mitigation", "risk participation"
+9.  **Question Category:** Eligibility Part 1
+    **Question:** [If yes to Q8] Select what conditions apply to the Lender's right to sub-participate
+    **Answer Options:** Multiselect: None, Borrower/Parent/Obligors consent, Borrower/Parent/Obligors consultation, Notice to Borrower/Parent/Obligors, Notice to Agent, Conditions relating to Permitted Lenders, Restricted Lenders and/or Competitors (or any similar concept), Other
+10. **Question Category:** Eligibility Part 1
+    **Question:** [If conditions relating to Permitted Lenders, Restricted Lenders and/or Competitors (or any similar concept) selected in Q9] Please detail what restrictions apply
+    **Answer Options:** BLANK
+11. **Question Category:** Eligibility Part 1
+    **Question:** [If Other selected in Q9] What other conditions apply?
+    **Answer Options:** BLANK
+12. **Question Category:** Eligibility Part 1
+    **Question:** [If Borrower/Parent/Obligors consent selected in Q9] Select all conditions that apply to Borrower's/Parent's/Obligors' consent
+    **Answer Options:** Multiselect: Not unreasonably withheld, Not unreasonably delayed, Deemed consent after a certain number of days, No conditions apply, Other
+13. **Question Category:** Eligibility Part 1
+    **Question:** [If Other selected in Q12] What other conditions apply?
+    **Answer Options:** BLANK
+14. **Question Category:** Eligibility Part 1
+    **Question:** [If Deemed consent selected in Q12] Number of days for deemed consent
+    **Answer Options:** BLANK
+15. **Question Category:** Eligibility Part 1
+    **Question:** Is this in days or Business Days?
+    **Answer Options:** Days, Business Days
+16. **Question Category:** Eligibility Part 1
+    **Question:** [If Notice to Borrower/Parent/Obligors selected in Q9] How many days notice to the Borrower/Parent/Obligors are required?
+    **Answer Options:** BLANK
+17. **Question Category:** Eligibility Part 1
+    **Question:** Is the notice period in days or Business Days?
+    **Answer Options:** Days, Business Days
+18. **Question Category:** Eligibility Part 1
+    **Question:** Is a form of notice specified?
+    **Answer Options:** Yes, No
+19. **Question Category:** Eligibility Part 1
+    **Question:** [If yes to Q18] Please detail the form of notice required
+    **Answer Options:** BLANK
+20. **Question Category:** Eligibility Part 1
+    **Question:** [If Borrower/Parent/Obligors consultation selected in Q9] Number of days required for consultation
+    **Answer Options:** BLANK
+21. **Question Category:** Eligibility Part 2
+    **Question:** Do any of the following key terms appear anywhere in the agreement, other than in the definition of sub-participation?
+    **Answer Options:** Multiselect: "risk protection", "credit protection", "risk mitigation", "risk transfer", "synthetic", "credit default swap", "securitisation", "risk or funded", "funded or risk", "credit mitigation", "risk participation"
+22. **Question Category:** Eligibility Part 2
+    **Question:** [If yes/terms selected in Q21] Please detail the relevant provision and clause number
+    **Answer Options:** BLANK
+23. **Question Category:** Eligibility Part 2
+    **Question:** [If yes/terms selected in Q21] Are there any conditions which apply to the provisions containing those key terms?
+    **Answer Options:** Multiselect: None, Borrower/Parent/Obligors consent, Borrower/Parent/Obligors consultation, Notice to Borrower/Parent/Obligors, Notice to Agent, Conditions relating to Permitted Lenders, Restricted Lenders and/or Competitors (or any similar concept), Other
+24. **Question Category:** Eligibility Part 2
+    **Question:** [If conditions relating to Permitted Lenders, Restricted Lenders and/or Competitors (or any similar concept) selected in Q23] Please detail what restrictions apply
+    **Answer Options:** BLANK
+25. **Question Category:** Eligibility Part 2
+    **Question:** [If Other selected in Q23] What other conditions apply?
+    **Answer Options:** BLANK
+26. **Question Category:** Eligibility Part 2
+    **Question:** [If Borrower/Parent/Obligors consent selected in Q23] Select all conditions that apply to Borrower's/Parent's/Obligors' consent
+    **Answer Options:** Multiselect: Not unreasonably withheld, Not unreasonably delayed, Deemed consent after a certain number of days, No conditions apply, Other
+27. **Question Category:** Eligibility Part 2
+    **Question:** [If Other selected in Q26] What other conditions apply?
+    **Answer Options:** BLANK
+28. **Question Category:** Eligibility Part 2
+    **Question:** [If Deemed consent selected in Q26] Number of days for deemed consent
+    **Answer Options:** BLANK
+29. **Question Category:** Eligibility Part 2
+    **Question:** Is this in days or Business Days?
+    **Answer Options:** Days, Business Days
+30. **Question Category:** Eligibility Part 2
+    **Question:** [If Notice to Borrower/Parent/Obligors selected in Q23] How many days notice to the Borrower/Parent/Obligors are required?
+    **Answer Options:** BLANK
+31. **Question Category:** Eligibility Part 2
+    **Question:** Is the notice period in days or Business Days?
+    **Answer Options:** Days, Business Days
+32. **Question Category:** Eligibility Part 2
+    **Question:** Is a form of notice specified?
+    **Answer Options:** Yes, No
+33. **Question Category:** Eligibility Part 2
+    **Question:** [If yes to Q32] Please detail the form of notice required
+    **Answer Options:** BLANK
+34. **Question Category:** Eligibility Part 2
+    **Question:** [If Borrower/Parent/Obligors consultation selected in Q23] Number of days required for consultation
+    **Answer Options:** BLANK
+35. **Question Category:** Eligibility
+    **Question:** Based on the questions in section Eligibility Part 1 and section Eligibility Part 2 above, please confirm if the facility you are reviewing can be included in a SRT without restrictions or conditions
+    **Answer Options:** Yes, No
+36. **Question Category:** Eligibility
+    **Question:** [If no to Q35] Please provide further details
+    **Answer Options:** BLANK
+37. **Question Category:** Confidentiality and Disclosure
+    **Question:** Does the agreement contain confidentiality/disclosure provisions?
+    **Answer Options:** Yes, No
+38. **Question Category:** Confidentiality and Disclosure
+    **Question:** [If yes to Q37] Please insert the relevant clause
+    **Answer Options:** BLANK
+39. **Question Category:** Confidentiality and Disclosure
+    **Question:** Is disclosure expressly permitted to any persons entering or potentially entering into transaction under which payments are to be made or may be made by reference to one or more Finance Documents (with or without restriction)?
+    **Answer Options:** Yes, No
+40. **Question Category:** Confidentiality and Disclosure
+    **Question:** Please set out the relevant provision including clause reference
+    **Answer Options:** BLANK
+41. **Question Category:** Confidentiality and Disclosure
+    **Question:** Is disclosure expressly permitted to any of the following parties in so far as they relate to any persons entering or potentially entering into transaction under which payments are made or may be made by reference to one or more Finance Documents (with or without restriction)?
+    **Answer Options:** Multiselect: Affiliates, Professional Advisers, Representatives, Related Funds, All of the above, None of the above
+42. **Question Category:** Confidentiality and Disclosure
+    **Question:** Is a confidentiality undertaking/other form of NDA required to disclose to any of these parties?
+    **Answer Options:** Multiselect: Affiliates, Professional Advisers, Representatives, Related Funds, Persons entering or potentially entering into transaction under which payments are to be made or may be made by reference to one or more Finance Documents, No confidentiality undertaking/other form of NDA required
+43. **Question Category:** Confidentiality and Disclosure
+    **Question:** Please set out the relevant definition of "Confidentiality Undertaking"
+    **Answer Options:** BLANK
+44. **Question Category:** Confidentiality and Disclosure
+    **Question:** [If Q42 indicates undertaking required] Is there a prescribed form of confidentiality undertaking / other form of NDA?
+    **Answer Options:** Yes, No
+45. **Question Category:** Confidentiality and Disclosure
+    **Question:** What form of confidentiality undertaking/other form of NDA is specified?
+    **Answer Options:** Multiselect: LMA form, Form agreed between the parties to the Facility Agreement, In the form set out in Schedule/Annex/Appendix/Side letter to loan document, LSTA form, Other form
+46. **Question Category:** Confidentiality and Disclosure
+    **Question:** [If 'In the form set out...' selected in Q45] Is the form of confidentiality undertaking substantially in a recommended form of the LMA?
+    **Answer Options:** Yes, No
+47. **Question Category:** Confidentiality and Disclosure
+    **Question:** [If 'Other form' selected in Q45] Is the form of confidentiality undertaking substantially in a recommended form of the LMA?
+    **Answer Options:** Yes, No
+48. **Question Category:** Confidentiality and Disclosure
+    **Question:** Does the definition of "Confidentiality Undertaking" expressly include any other conditions?
+    **Answer Options:** Yes, No
+49. **Question Category:** Confidentiality and Disclosure
+    **Question:** [If yes to Q48] Please detail any additional conditions which apply
+    **Answer Options:** BLANK
+50. **Question Category:** Confidentiality and Disclosure
+    **Question:** Is Borrower/Obligor/Parent consent required to disclose to any of these parties?
+    **Answer Options:** Multiselect: Affiliates, Professional Advisers, Representatives, Related Funds, Persons entering or potentially entering into transaction under which payments are to be made or may be made by reference to one or more Finance Documents, None of the above
+51. **Question Category:** Confidentiality and Disclosure
+    **Question:** Please set out the relevant consent provision including clause reference
+    **Answer Options:** BLANK
+52. **Question Category:** Confidentiality and Disclosure
+    **Question:** Is there a requirement for the Borrower, Obligor, Parent to be notified in order for disclosure of confidential information to be permitted to any of these parties?
+    **Answer Options:** Multiselect: Affiliates, Professional Advisers, Representatives, Related Funds, Persons entering or potentially entering into transaction under which payments are to be made or may be made by reference to one or more Finance Documents, None of the above
+53. **Question Category:** Confidentiality and Disclosure
+    **Question:** Please set out the relevant notification provision including clause reference
+    **Answer Options:** BLANK
+54. **Question Category:** Confidentiality and Disclosure
+    **Question:** If a confidentiality undertaking / other form of NDA is required, is there any requirement to obtain consent from and/ or notify any party in relation to that undertaking/ NDA?
+    **Answer Options:** Multiselect: Requirement to obtain consent in relation to the Confidentiality undertaking/NDA, Requirement to notify in relation to the Confidentiality undertaking/NDA, Requirement to send a copy of the Confidentiality Undertaking to the Borrower/Parent/Obligors before disclosure, Requirement to send a copy of the confidentiality undertaking to the Borrower/Parent/Obligors after disclosure, No requirements, No confidentiality undertaking/ other form of NDA required
+55. **Question Category:** Confidentiality and Disclosure
+    **Question:** Please set out the relevant consent provision including clause reference.
+    **Answer Options:** BLANK
+56. **Question Category:** Confidentiality and Disclosure
+    **Question:** Is there any restriction in the confidentiality or in the assignment and transfer provisions which prevents the Lender from disclosing information to any of the following?
+    **Answer Options:** Multiselect: Permitted Lenders, Restricted Lenders, Competitors (or any similar concept), No restrictions, No Permitted Lender/Restricted Lender/Competitor concepts
+57. **Question Category:** Confidentiality and Disclosure
+    **Question:** Please set out the relevant restriction including clause reference.
+    **Answer Options:** BLANK
+58. **Question Category:** Confidentiality and Disclosure
+    **Question:** Ignoring any requirement for a confidentiality undertaking substantially in a form recommended by the LMA, is disclosure expressly permitted to persons [potentially] entering into a transaction under which payments are made/may be made without conditions
+    **Answer Options:** Yes, No
+59. **Question Category:** Confidentiality and Disclosure
+    **Question:** Is disclosure expressly permitted to any Affiliates to National Westminster Bank Plc without restriction or any conditions? Answer 'Yes' even if conditions apply, as long as they only include the accepted exceptions (namely: declaring its confidential nature to whom it is being disclosed, information regarding price sensitivity, recipient's professional obligations to maintain confidentiality).
+    **Answer Options:** Yes, No
+60. **Question Category:** Confidentiality and Disclosure
+    **Question:** Please detail any restrictions or conditions which apply to disclosure to Affiliates. If the conditions found are only part of the accepted exceptions list (namely: declaring its confidential nature to whom it is being disclosed, information regarding price sensitivity, recipient's professional obligations to maintain confidentiality), you do not need to report them; just answer 'No'. Otherwise, detail the conditions.
+    **Answer Options:** Text
+61. **Question Category:** Confidentiality and Disclosure
+    **Question:** Is disclosure expressly permitted to any Representatives to National Westminster Bank Plc without restriction or any conditions? Answer 'Yes' even if conditions apply, as long as they only include the accepted exceptions list (namely: declaring its confidential nature to whom it is being disclosed, information regarding price sensitivity, recipient's professional obligations to maintain confidentiality).
+    **Answer Options:** Yes, No
+62. **Question Category:** Confidentiality and Disclosure
+    **Question:** Please detail any restrictions or conditions which apply to disclosure to Representatives. If the conditions found are only part of the accepted exceptions list (namely: declaring its confidential nature to whom it is being disclosed, information regarding price sensitivity, recipient's professional obligations to maintain confidentiality), you do not need to report them; just answer 'No'. Otherwise, detail the conditions.
+    **Answer Options:** TextMultiline
+63. **Question Category:** Confidentiality and Disclosure
+    **Question:** Please set out the relevant definition of “Representative"
+    **Answer Options:** TextMultiline
+64. **Question Category:** Additional Borrowers
+    **Question:** Does the agreement provide for the accession of Additional Borrowers?
+    **Answer Options:** Yes, No
+65. **Question Category:** Additional Borrowers
+    **Question:** Does the accession of additional Borrowers require Lender Consent?
+    **Answer Options:** Consent of Simple majority Lenders (over 50%), Consent of simple majority plus consent of affected lenders, Consent of Majority Lenders (66.666%), Consent of Super majority Lenders (75%), Consent of all Lenders, Silent, Consent of all affected Lenders, Consent of Majority (66.666%) plus consent of affected Lenders, Other, No Lender consent required
+66. **Question Category:** Additional Borrowers
+    **Question:** Please provide details of the relevant requirements
+    **Answer Options:** Text
+67. **Question Category:** Interest rate provisions
+    **Question:** Does the facility contain an interest rate floor?
+    **Answer Options:** Yes, No
+68. **Question Category:** Interest rate provisions
+    **Question:** Is the interest rate floor set at a rate other than zero?
+    **Answer Options:** Yes, No
+69. **Question Category:** Interest rate provisions
+    **Question:** Please set out the relevant rate
+    **Answer Options:** Text
+70. **Question Category:** Interest rate provisions
+    **Question:** Does the facility contain an interest rate cap?
+    **Answer Options:** Yes, No
+71. **Question Category:** Interest rate provisions
+    **Question:** Please provide further details.
+    **Answer Options:** Text
+72. **Question Category:** Prepayment Fee
+    **Question:** Is a charge or fee payable on prepayments (whether full or partial)?
+    **Answer Options:** Yes, No
+73. **Question Category:** Prepayment Fee
+    **Question:** Prepayments permitted up to certain amount per year before charges?
+    **Answer Options:** Yes, No
+74. **Question Category:** Prepayment Fee
+    **Question:** What is the threshold of prepayments permitted before charges are incurred?
+    **Answer Options:** Text
+75. **Question Category:** Prepayment Fee
+    **Question:** Is there a date after which borrower can make prepayments without fee or penalty?
+    **Answer Options:** Yes, No, Yes but unable to confirm date
+76. **Question Category:** Prepayment Fee
+    **Question:** Date after which borrower can make prepayments without fee or penalty
+    **Answer Options:** Text
+77. **Question Category:** Prepayment Fee
+    **Question:** What prepayment fees are payable?
+    **Answer Options:** Text
+78. **Question Category:** Prepayment Fee
+    **Question:** Please detail the relevant clause which governs the payment of a prepayment fee
+    **Answer Options:** Text
+
+**Final Instruction:**
+Ensure the final output is a valid JSON array containing an object for **all** questions provided in the filtered list above, following all formatting and content instructions precisely. **Crucially, double-check that every object in the array contains all the required keys (`Question Number`, `Question Category`, `Question`, `Answer`, `Clause Reference`, `Clause Wording`, `Answer Justification`) before concluding.**
+"""
+
+# Define the question ranges for each section based on original numbering
+SECTIONS_TO_RUN = {
+    "agreement_details": (1, 4),
+    "eligibility": (5, 36),
+    "confidentiality": (37, 63),
+    "prepayment_interest": (67, 78)
+}
+
+# --- System Instruction Text ---
+system_instruction_text = """You are analysing a facility agreement to understand whether the asset can be included within a Significant Risk Transfer or not (or with conditions, requirements, or exceptions) at NatWest. Your output must be precise, factual, and directly supported by evidence from the provided document(s). You must answer with UK spelling, not US. (e.g. 'analyse' is correct while 'analyze' is not). Adhere strictly to the JSON schema provided, ensuring every object in the output array contains all required keys."""
+
+# --- filter_prompt_by_section function ---
+# (Keep as is)
+def filter_prompt_by_section(initial_full_prompt, section):
+    if section not in SECTIONS_TO_RUN:
+        raise ValueError(f"Invalid section specified: {section}. Must be one of {list(SECTIONS_TO_RUN.keys())}")
+    start_q, end_q = SECTIONS_TO_RUN[section]
+    questions_start_marker = "**Questions to Answer:**"
+    questions_end_marker = "**Final Instruction:**"
+    try:
+        start_index = initial_full_prompt.index(questions_start_marker)
+        end_index = initial_full_prompt.index(questions_end_marker)
+        prompt_header = initial_full_prompt[:start_index]
+        full_questions_block = initial_full_prompt[start_index + len(questions_start_marker):end_index].strip()
+        prompt_footer = initial_full_prompt[end_index:]
+    except ValueError:
+        raise ValueError("Could not find question block markers ('**Questions to Answer:**' or '**Final Instruction:**') in the main prompt text definition.")
+
+    question_entries = re.split(r'\n(?=\s*\d+\.\s*?\*\*Question Category:)', full_questions_block)
+    if not question_entries or len(question_entries) < 2 :
+         question_entries = re.split(r'\n(?=\d+\.\s)', full_questions_block)
+         if not question_entries or len(question_entries) < 2:
+              question_entries = re.split(r'\n(?=\*\*Question Category:)', full_questions_block)
+
+    filtered_question_texts = []
+    for entry in question_entries:
+        entry = entry.strip()
+        if not entry: continue
+        match = re.match(r'^(\d+)\.', entry)
+        if match:
+            q_num = int(match.group(1))
+            if start_q <= q_num <= end_q:
+                filtered_question_texts.append(entry)
+        elif re.search(r'^\s*?\*\*Question Category:', entry):
+             print(f"Warning: Could not parse question number from potential question entry: {entry[:100]}...")
+
+    if not filtered_question_texts:
+        raise ValueError(f"No questions found for section '{section}' in range {start_q}-{end_q} within the extracted full question list.")
+
+    filtered_questions_string = "\n".join(filtered_question_texts)
+    task_end_marker = "specified section."
+    insert_pos = prompt_header.find(task_end_marker)
+    if insert_pos != -1:
+         insert_pos += len(task_end_marker)
+         section_note = f"\n\n**Current Focus:** Answering ONLY questions for the '{section.upper()}' section (Questions {start_q}-{end_q}). The list below contains ONLY these questions.\n"
+         final_header = prompt_header[:insert_pos] + section_note + prompt_header[insert_pos:]
+    else:
+         final_header = prompt_header + f"\n\n**Current Focus:** Answering ONLY questions for the '{section.upper()}' section (Questions {start_q}-{end_q}).\n"
+    final_prompt_for_api = f"{final_header}{questions_start_marker}\n\n{filtered_questions_string}\n\n{prompt_footer}"
+    return final_prompt_for_api
+
+# --- validate_ai_data function ---
+# (Keep as is)
+def validate_ai_data(data, section_name):
+    if not isinstance(data, list):
+        print(f"Error: AI Data for validation in section '{section_name}' is not a list.")
+        return None
+    validated_data = []
+    valid_count = 0
+    invalid_count = 0
+    for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            print(f"Warning [Section: {section_name}, Item Index: {index}]: Item is not a dictionary, skipping.")
+            invalid_count += 1
+            continue
+        item_keys = set(item.keys())
+        missing_keys = AI_REQUIRED_KEYS - item_keys
+        if not missing_keys:
+            validated_data.append(item)
+            valid_count += 1
+        else:
+            q_num_str = f"Q#{item.get('Question Number', 'Unknown')}"
+            print(f"Warning [Section: {section_name}, Item: {q_num_str}]: Skipping item due to missing AI keys: {sorted(list(missing_keys))}")
+            invalid_count += 1
+    if invalid_count > 0:
+        print(f"AI Data Validation Summary [Section: {section_name}]: {valid_count} valid items, {invalid_count} invalid items skipped.")
+
+    # Return the validated data, which will be an empty list if all items failed validation
+    return validated_data
+
+
+# --- append_to_excel function ---
+# (Keep as is)
+def append_to_excel(data_to_append, filename):
+    if not data_to_append:
+        print("No validated data to append to Excel.")
+        return False
+    new_df = pd.DataFrame(data_to_append)
+    for col in EXCEL_COLUMN_ORDER:
+        if col not in new_df.columns:
+            print(f"Warning: Column '{col}' was missing in the data to append, adding it as empty.")
+            new_df[col] = None
+    try:
+        new_df = new_df[EXCEL_COLUMN_ORDER]
+    except KeyError as e:
+        print(f"ERROR: Could not reorder DataFrame columns before append. Missing key: {e}")
+        return False
+    try:
+        if os.path.exists(filename):
+            try:
+                existing_df = pd.read_excel(filename, header=0)
+                for col in EXCEL_COLUMN_ORDER:
+                    if col not in existing_df.columns:
+                        existing_df[col] = None
+                existing_df = existing_df[EXCEL_COLUMN_ORDER]
+            except FileNotFoundError:
+                 print(f"Info: Existing file '{filename}' not found, will create a new one.")
+                 existing_df = pd.DataFrame(columns=EXCEL_COLUMN_ORDER)
+            except Exception as read_err:
+                print(f"Warning: Error reading existing Excel file '{filename}': {read_err}. Attempting to overwrite/create.")
+                existing_df = pd.DataFrame(columns=EXCEL_COLUMN_ORDER)
+            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+            initial_rows = len(combined_df)
+            combined_df.drop_duplicates(subset=EXCEL_COLUMN_ORDER, keep='first', inplace=True)
+            rows_dropped = initial_rows - len(combined_df)
+            if rows_dropped > 0:
+                print(f"Removed {rows_dropped} duplicate rows before saving.")
+            combined_df.to_excel(filename, index=False, engine='openpyxl')
+        else:
+            print(f"Creating new Excel file: {filename}")
+            initial_rows = len(new_df)
+            new_df.drop_duplicates(subset=EXCEL_COLUMN_ORDER, keep='first', inplace=True)
+            rows_dropped = initial_rows - len(new_df)
+            if rows_dropped > 0:
+                print(f"Removed {rows_dropped} duplicate rows from initial data before saving.")
+            new_df.to_excel(filename, index=False, engine='openpyxl')
+        return True
+    except PermissionError:
+        print(f"\nERROR: Permission denied when trying to write to '{filename}'.")
+        print("PLEASE ENSURE THE EXCEL FILE IS CLOSED and you have write permissions.")
+        print("Skipping Excel update for this section.")
+        return False
+    except Exception as e:
+        print(f"ERROR: An unexpected error occurred while writing to Excel file '{filename}': {e}")
+        return False
+
+# --- generate_section_analysis function (MODIFIED for RETRY and Temperature/Top_P) ---
+def generate_section_analysis(section, uploaded_file_ref):
+    """Generates analysis for a specific section using pre-uploaded file, validates AI response,
+       and retries ONCE if validation fails. Returns validated data."""
+    print(f"\n--- Starting analysis for section: {section} ---")
+    api_key = os.environ.get(API_KEY_ENV_VAR)
+    if not api_key:
+         print(f"Error: API Key {API_KEY_ENV_VAR} not found during section analysis.")
+         return None
+    genai.configure(api_key=api_key)
+
+    if not uploaded_file_ref:
+        print(f"Error: No valid uploaded file reference provided for section '{section}'.")
+        return None
+
+    model = genai.GenerativeModel(
+        model_name=MODEL_NAME,
+        system_instruction=system_instruction_text
+    )
+
+    # --- MODIFIED LINE ---
+    # Add temperature=0.0 and top_p=0.0 here
+    generation_config = types.GenerationConfig(
+        response_mime_type="application/json",
+        response_schema=ai_response_schema_dict,
+        temperature=0.0,  # Set temperature to 0 for deterministic output
+        top_p=0.05,         # Set top_p to 0 to further reduce randomness (greedy decoding)
+        top_k=1
+    )
+    # --- END MODIFIED LINE ---
+
+
+    final_validated_data = None # Store the final result
+
+    # Loop for attempts (max 1 + MAX_VALIDATION_RETRIES)
+    # Start attempt count from 1, loop runs 1 (initial) + MAX_VALIDATION_RETRIES times max
+    for attempt in range(1, 1 + MAX_VALIDATION_RETRIES + 1):
+        if attempt > 1: # This means we are retrying
+             print(f"--- Validation Retry Attempt {attempt-1}/{MAX_VALIDATION_RETRIES} for section '{section}' after delay ---")
+             time.sleep(RETRY_DELAY_SECONDS) # Wait before retrying
+
+        try:
+            prompt_for_api = filter_prompt_by_section(full_prompt_text, section)
+            contents = [uploaded_file_ref, prompt_for_api]
+
+            print(f"Attempt {attempt}: Generating content for section: {section} with temp=0.0, top_p=0.0...")
+            response = model.generate_content(
+                contents=contents,
+                generation_config=generation_config, # Pass the config object here
+            )
+
+            parsed_ai_data = None # Reset for this attempt
+            validated_ai_data = None # Reset for this attempt
+
+            if response.parts:
+                full_response_text = response.text
+                try:
+                    parsed_ai_data = json.loads(full_response_text)
+                    print(f"Attempt {attempt}: Successfully parsed JSON response. Starting AI data validation...")
+                    validated_ai_data = validate_ai_data(parsed_ai_data, section)
+
+                    # Check if validation succeeded (returns non-empty list)
+                    if validated_ai_data: # This checks for None and non-empty list
+                        print(f"Attempt {attempt}: Validation successful for section '{section}'.")
+                        final_validated_data = validated_ai_data # Store successful result
+                        break # Exit the retry loop on successful validation
+                    else:
+                        # Validation failed (returned None or empty list)
+                        print(f"Attempt {attempt}: AI response failed structure validation for section '{section}'.")
+                        # Loop will continue to retry if attempts remain
+
+                except json.JSONDecodeError as json_err:
+                    print(f"ERROR (Attempt {attempt}): Failed to parse JSON response for section '{section}': {json_err}")
+                    # Optionally print response text for debugging
+                    # print("--- Received Text ---")
+                    # print(full_response_text[:500] + "..." if len(full_response_text) > 500 else full_response_text)
+                    # print("--- End Received Text ---")
+                    # Loop will continue to retry if attempts remain
+
+            else:
+                print(f"Warning (Attempt {attempt}): Received an empty response from the AI for section '{section}'.")
+                # Check for blocking reasons if available
+                block_reason = "Unknown"
+                block_message = "No specific message."
+                try:
+                    if response.prompt_feedback and response.prompt_feedback.block_reason:
+                         block_reason = response.prompt_feedback.block_reason.name # Get enum name
+                         block_message = response.prompt_feedback.block_reason_message or "No specific message."
+                except AttributeError:
+                     pass # Handle cases where prompt_feedback might not exist as expected
+                print(f"Generation may have been blocked. Reason: {block_reason}. Message: {block_message}")
+
+                # Loop will continue to retry if attempts remain (treat empty response as failure)
+
+        # Handle potential API errors during the attempt
+        except types.generation_types.BlockedPromptException as bpe:
+             print(f"ERROR (Attempt {attempt}): Prompt was blocked for section '{section}'. Reason: {bpe}")
+             # Decide if retry makes sense for blocked prompts (maybe not) - currently continues
+        except types.generation_types.StopCandidateException as sce:
+             print(f"ERROR (Attempt {attempt}): Generation stopped unexpectedly for section '{section}'. Reason: {sce}")
+             # Decide if retry makes sense - currently continues
+        except Exception as e:
+            # Catching potential errors during the API call itself more specifically
+            print(f"ERROR (Attempt {attempt}): An API or processing error occurred during content generation for section '{section}': {type(e).__name__} - {e}")
+            # Decide if retry makes sense for general errors - currently continues
+
+        # Check if we successfully validated and broke the loop
+        if final_validated_data is not None:
+             break
+
+    # After the loop (either break on success or exhausted retries)
+    if final_validated_data is None:
+         print(f"--- Validation FAILED for section '{section}' after {attempt} attempt(s). ---")
+
+    print(f"--- Finished analysis attempts for section: {section} ---")
+    return final_validated_data # Return the validated data (or None if all attempts failed)
+
+
+# --- Main Execution Block (MODIFIED) ---
+if __name__ == "__main__":
+    run_start_time = datetime.now()
+    run_timestamp_str = run_start_time.strftime("%Y-%m-%d %H:%M:%S")
+    base_file_name = os.path.basename(FILE_PATH)
+    print(f"--- Starting Script Run at: {run_timestamp_str} for file: {base_file_name} ---")
+
+    api_key = os.environ.get(API_KEY_ENV_VAR)
+    if not api_key:
+        print(f"Error: Please set the {API_KEY_ENV_VAR} environment variable.")
+        sys.exit(1)
+    genai.configure(api_key=api_key)
+
+    if not os.path.exists(FILE_PATH):
+        print(f"Error: Input file not found at '{FILE_PATH}'")
+        sys.exit(1)
+
+    if os.path.exists(EXCEL_OUTPUT_FILE):
+         try:
+              test_file = open(EXCEL_OUTPUT_FILE, "a")
+              test_file.close()
+              print(f"Output file '{EXCEL_OUTPUT_FILE}' exists and appears writable.")
+         except IOError:
+              print(f"\nWARNING: Output file '{EXCEL_OUTPUT_FILE}' exists but might be locked or unwritable.")
+              print("Please ensure it is closed in other applications before proceeding.\n")
+
+    uploaded_file = None
+    print(f"Uploading file '{FILE_PATH}' once for the entire run...")
+    try:
+        uploaded_file = genai.upload_file(path=FILE_PATH)
+        print(f"File uploaded successfully: {uploaded_file.name} ({uploaded_file.uri})")
+    except Exception as e:
+        print(f"FATAL ERROR: Could not upload file '{FILE_PATH}': {e}")
+        if uploaded_file and hasattr(uploaded_file, 'name') and uploaded_file.name:
+             try: genai.delete_file(name=uploaded_file.name)
+             except Exception as delete_e: print(f"Error during cleanup: {delete_e}")
+        sys.exit(1)
+
+    overall_success = True
+    sections_with_errors = []
+    any_data_appended = False
+
+    try: # Main processing block
+        for section_name in SECTIONS_TO_RUN.keys():
+            section_validated_data = None # Renamed for clarity
+            excel_append_success = False
+            try:
+                # Generate and Validate AI Data (with retry logic inside)
+                section_validated_data = generate_section_analysis(section_name, uploaded_file)
+
+                if section_validated_data: # Check if validation (including retry) was ultimately successful
+                    print(f"Adding File Name and Generation Time to {len(section_validated_data)} validated records for section '{section_name}'...")
+                    for item in section_validated_data:
+                        item["File Name"] = base_file_name
+                        item["Generation Time"] = run_timestamp_str
+
+                    excel_append_success = append_to_excel(section_validated_data, EXCEL_OUTPUT_FILE)
+                    if excel_append_success:
+                        any_data_appended = True
+                    else:
+                        overall_success = False
+                        # Error type logged inside append_to_excel now
+                        sections_with_errors.append(f"{section_name} (Excel Write Error)")
+
+                else:
+                    # This now means validation failed even after retries
+                    print(f"Validation failed for section '{section_name}' after retries, skipping Excel append.")
+                    overall_success = False # Mark validation failure as an overall issue
+                    sections_with_errors.append(f"{section_name} (Validation Failed)")
+
+                # Delay between processing *sections*, regardless of success/retry state
+                time.sleep(2)
+
+            except KeyboardInterrupt:
+                 print("\n--- Script execution interrupted by user (Ctrl+C) ---")
+                 overall_success = False
+                 sections_with_errors.append(f"{section_name} (Interrupted)")
+                 break
+            except Exception as loop_err:
+                 print(f"\n--- CRITICAL ERROR during processing loop for section '{section_name}' ---")
+                 print(f"Error details: {loop_err}")
+                 overall_success = False
+                 sections_with_errors.append(f"{section_name} (Loop Error: {loop_err})")
+
+    finally:
+        # --- Delete File ONCE ---
+        if uploaded_file and hasattr(uploaded_file, 'name') and uploaded_file.name:
+            print(f"\nDeleting uploaded file: {uploaded_file.name}...")
+            try:
+                genai.delete_file(name=uploaded_file.name)
+                print("File deleted successfully.")
+            except Exception as e:
+                print(f"Error deleting file '{uploaded_file.name}': {e}")
+        else:
+            print("\nSkipping file deletion (file object not available or upload failed).")
+
+
+    # --- Final Summary ---
+    print("\n--- Overall Process Complete ---")
+    if overall_success and any_data_appended and not sections_with_errors:
+        print(f"All sections processed successfully. Results appended to '{EXCEL_OUTPUT_FILE}'.")
+    elif any_data_appended:
+         print(f"Run finished, but one or more sections may have encountered errors or failed validation.")
+         if sections_with_errors:
+             print(f"Sections reporting issues: {', '.join(sections_with_errors)}")
+         print(f"Successfully generated and validated results (if any) have been appended to '{EXCEL_OUTPUT_FILE}'. Please review logs and the output file.")
+    else:
+         print(f"Run finished, but NO new data was appended to '{EXCEL_OUTPUT_FILE}'.")
+         if sections_with_errors:
+              print(f"Sections reporting issues: {', '.join(sections_with_errors)}")
+         print("Please review logs for errors.")
